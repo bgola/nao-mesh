@@ -4,9 +4,11 @@ Advertise:
 """
 
 import uasyncio
+import time
 
 BROADCAST = b'\xff\xff\xff\xff\xff\xff'
 MAC_ADDR_LENGTH = len(BROADCAST)
+PEER_TIMEOUT = 1000000000
 
 class Mesh:
     def __init__(self, espnow):
@@ -37,20 +39,31 @@ class Mesh:
             if mesh_msg.kind == Message.ADVERTISEMENT:
                 self.on_advertisement(mesh_msg)
             await uasyncio.sleep_ms(100)
-    
+   
+    async def remove_dead_peers(self):
+        while True:
+            now = time.time_ns()
+            for host, peer in self.peers.items():
+                if now - peer['last_seen'] > PEER_TIMEOUT:
+                    del self.peers[host]
+                    print("removed: ", host)
+            await uasyncio.sleep_ms(200)
+
     def on_advertisement(self, mesh_msg):
         if mesh_msg.host not in self.peers:
             self.on_new_reacheable_peer(mesh_msg.host, mesh_msg.data)
 
         # Update the list of unreacheable peers
-        self.peers[mesh_msg.host] = mesh_msg.data
+        self.peers[mesh_msg.host] = {'last_seen': time.time_ns(), 'peers': mesh_msg.data}
+        print(self.peers)
 
     def on_new_reacheable_peer(self, host, peers):
-        print(self.peers)
+        pass
 
     async def main(self):
         uasyncio.create_task(self.advertise())
         uasyncio.create_task(self.check_messages())
+        uasyncio.create_task(self.remove_dead_peers())
 
 
 class Message:
