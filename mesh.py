@@ -6,10 +6,14 @@ Advertise:
 import network
 import uasyncio
 import time
+import struct
 
 BROADCAST = b'\xff\xff\xff\xff\xff\xff'
 MAC_ADDR_LENGTH = len(BROADCAST)
-PEER_TIMEOUT = 1000000000
+PEER_TIMEOUT = 1000
+
+def get_time_ms():
+    return time.time_ns() // 1000000
 
 class Mesh:
     def __init__(self, espnow):
@@ -33,7 +37,9 @@ class Mesh:
 
     async def advertise(self):
         while True:
-            msg = Message(kind=Message.ADVERTISEMENT, sender=self.mac_addr, receiver=BROADCAST, data=self.peers.keys())
+            msg = Message(
+                    kind=Message.ADVERTISEMENT, sender=self.mac_addr, receiver=BROADCAST,
+                    timestamp=get_time_ms(), data=self.peers.keys())
             self.send(msg)
             await uasyncio.sleep_ms(500)
 
@@ -47,7 +53,7 @@ class Mesh:
 
     async def remove_dead_peers(self):
         while True:
-            now = time.time_ns()
+            now = get_time_ms()
             for host, peer in self.peers.items():
                 if now - peer['last_seen'] > PEER_TIMEOUT:
                     del self.peers[host]
@@ -59,7 +65,7 @@ class Mesh:
             self.on_new_reacheable_peer(message.host, message.data)
 
         # Update the list of unreacheable peers
-        self.peers[message.host] = {'last_seen': time.time_ns(), 'peers': message.data}
+        self.peers[message.host] = {'last_seen': get_time_ms(), 'peers': message.data}
         print(self.peers)
 
     def on_new_reacheable_peer(self, host, peers):
@@ -74,12 +80,12 @@ class Mesh:
 class Message:
     ADVERTISEMENT = 0
 
-    def __init__(self, raw_data=b'', host=b'', sender=b'', receiver=b'', timestamp=b'', kind=-1, data=None):
+    def __init__(self, raw_data=b'', host=b'', sender=b'', receiver=b'', timestamp=0, kind=-1, data=None):
         self.raw_data = raw_data
         self.host = host
         self.sender = sender
         self.receiver = receiver
-        self.timestamp = b'\x00\x00\x00\x00\x00\x00'
+        self.timestamp = timestamp
         self.kind = kind
         self.data = data
 
@@ -87,22 +93,26 @@ class Message:
             self._parse_raw_data()
 
     def as_bytearray(self):
-        raw_data = self.sender + self.receiver + self.timestamp + bytearray([self.kind])
+        raw_data = self.sender + self.receiver + struct.pack('I', self.timestamp) + bytearray([self.kind])
         if self.kind == Message.ADVERTISEMENT and self.data:
             raw_data = raw_data + sum(self.data, b'')
         return raw_data
 
     def _parse_raw_data(self):
         try:
-            self.host, self.sender, self.receiver, self.timestamp, self.kind, payload = (
+            self.host, self.sender, self.receiver, timestamp, self.kind, payload = (
                     self.raw_data[2:8], self.raw_data[8:14], self.raw_data[14:20],
-                    self.raw_data[20:26], self.raw_data[26], self.raw_data[27:]
+                    self.raw_data[20:24], self.raw_data[24], self.raw_data[25:]
                     )
         except IndexError as err:
             # Got bad message?
             print("Got a bad message: ", self.raw_data)
         else:
+            self._parse_timestamp(timestamp)
             self._parse_payload(payload)
+
+    def _parse_timestamp(self, timestamp):
+        self.timestamp = struct.unpack('I', timestamp)[0]
 
     def _parse_payload(self, payload):
         if self.kind == Message.ADVERTISEMENT:
