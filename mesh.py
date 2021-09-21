@@ -14,20 +14,25 @@ class Mesh:
         self.espnow = espnow
         self.mac_addr = network.WLAN().config('mac')
         self.stream_reader = uasyncio.StreamReader(self.espnow)
-        self.time_sync_offset = 0
+        self.timesync_offset = 0
+        self.timesync_peer = b''
+        self.timesync_tasks = []
+
         self._message_handlers = {
                 Message.ADVERTISEMENT: self.on_advertisement,
-                Message.ADVERTISEMENT_REPLY: self.on_advertisement_reply,
+                Message.TIMESYNC_REPLY: self.on_timesync_reply,
                 Message.TIMESYNC_REQUEST: self.on_timesync_request,
         }
         # TODO: reverse peers
         self.add_peer(BROADCAST)
+        self.timesync_tasks.append(Task(self.blink, 1500, self.time_ns))
+        self.timesync_tasks[0].start()
+
+    def blink(self):
+        print(" " * int(urandom.random()*20), "blink!")
 
     def time_ns(self):
-        return time.time_ns() + self.time_sync_offset
-
-    def time_ns_host(self, host):
-        return time.time_ns() + self.peers[host]['time_offset']
+        return time.time_ns() + self.timesync_offset
 
     def add_peer(self, addr):
         try:
@@ -37,9 +42,7 @@ class Mesh:
                 raise e
 
     def send(self, message):
-        timestamp = None
-        if message.receiver != BROADCAST and message.receiver in self.peers:
-            timestamp = self.time_ns_host(message.receiver) 
+        timestamp = self.time_ns() 
         self.espnow.send(message.receiver, message.as_bytearray(timestamp))
 
     async def advertise(self):
@@ -54,7 +57,6 @@ class Mesh:
         while True:
             raw_package = await self.stream_reader.read(-1)
             msg = Message(raw_package)
-            if msg.kind != 0: print("Got: ", msg)
             self._message_handlers[msg.kind](msg)
 
     async def remove_dead_peers(self):
@@ -62,10 +64,25 @@ class Mesh:
             now = self.time_ns()
             for host, peer in self.peers.items():
                 if now - peer['last_seen'] > PEER_TIMEOUT:
-                    self.espnow.del_peer(host)
                     del self.peers[host]
+                    self.espnow.del_peer(host)
+                    if self.timesync_peer == host:
+                        self.timesync_peer = b''
+                        self.get_new_timesync_peer()
                     print("removed: ", host)
             await uasyncio.sleep_ms(200)
+
+    def get_new_timesync_peer(self):
+        if not self.peers:
+            return
+
+        max_peers = 0
+        chosen_peer = b''
+        for addr, peer in self.peers.items():
+            if len(peer['peers']) > max_peers:
+                max_peers = len(peer['peers'])
+                chosen_peer = addr
+        self.send_timesync_request(addr)
 
     def on_advertisement(self, message):
         if message.host not in self.peers:
@@ -75,11 +92,10 @@ class Mesh:
         self.peers[message.host]['last_seen']= self.time_ns()
         self.peers[message.host]['peers'] =  message.data
 
-    def on_advertisement_reply(self, message):
+    def on_timesync_reply(self, message):
         number_peers = len(self.peers)
 
         if message.host not in self.peers:
-            print("ask for timesync request")
             self.add_peer(message.host)
             self.send_timesync_request(message.host)
             self.espnow.del_peer(message.host)
@@ -91,31 +107,41 @@ class Mesh:
             now = self.time_ns()
             offset = (message.data[1] - message.data[0])/2 + (message.timestamp - now)/2
             trip_delay = (now - message.data[0]) - (message.timestamp - message.data[1])
-            self.peers[message.host]['time_offset'] += int(offset)
+            self.timesync_offset += int(offset)
+            self.timesync_peer = message.host
             if offset > 50000000:
                 self.send_timesync_request(message.host)
+                return
+            self.new_timesync_adjusted()
+
+    def new_timesync_adjusted(self):
+        print("Adjusting offset to ", self.timesync_offset, " with ", self.timesync_peer)
+        for task in self.timesync_tasks:
+            task.reset()
 
     def on_timesync_request(self, message):
+        if message.host not in self.peers:
+            return
         time_received = self.time_ns()
-        self.send_advertisement_reply(message, time_received)
+        self.send_timesync_reply(message, time_received)
 
     def send_timesync_request(self, host):
         msg = Message(kind=Message.TIMESYNC_REQUEST, sender=self.mac_addr, receiver=host)
         self.send(msg)
 
-    def send_advertisement_reply(self, original_message, time_received):
+    def send_timesync_reply(self, original_message, time_received):
         original_timestamp = original_message.timestamp
         msg = Message(
-                kind=Message.ADVERTISEMENT_REPLY, sender=self.mac_addr, receiver=original_message.host, 
+                kind=Message.TIMESYNC_REPLY, sender=self.mac_addr, receiver=original_message.host, 
                 data=(original_timestamp, time_received))
         self.send(msg)
-        print("Sent advertisement reply: ", msg)
 
     def on_new_reacheable_peer(self, message):
         time_received = self.time_ns()
         self.add_peer(message.host)
-        self.peers[message.host] = {'time_offset': 0, 'last_seen': self.time_ns(), 'peers': []}
-        self.send_advertisement_reply(message, time_received)
+        self.peers[message.host] = {'last_seen': self.time_ns(), 'peers': []}
+        if not self.timesync_peer:
+            self.send_timesync_request(message.host)
 
     async def main(self):
         uasyncio.create_task(self.advertise())
@@ -124,7 +150,7 @@ class Mesh:
 
 class Message:
     ADVERTISEMENT = 0
-    ADVERTISEMENT_REPLY = 1
+    TIMESYNC_REPLY = 1
     TIMESYNC_REQUEST = 2
 
     def __init__(self, raw_data=b'', host=b'', sender=b'', receiver=b'', timestamp=None, kind=-1, data=None):
@@ -150,7 +176,7 @@ class Message:
         
         if self.kind == Message.ADVERTISEMENT and self.data:
             raw_data = raw_data + sum(self.data, b'')
-        elif self.kind == Message.ADVERTISEMENT_REPLY:
+        elif self.kind == Message.TIMESYNC_REPLY:
             # data is a tuple with (original_sender_timestamp, message_received_timestamp)
             raw_data = raw_data + sum((struct.pack('Q', time) for time in self.data), b'')
         return raw_data
@@ -176,9 +202,33 @@ class Message:
             self.data = [ payload[i:i + MAC_ADDR_LENGTH] for i in range(0, len(payload), MAC_ADDR_LENGTH) ]
             return
 
-        if self.kind == Message.ADVERTISEMENT_REPLY:
+        if self.kind == Message.TIMESYNC_REPLY:
             self.data = struct.unpack('QQ', payload)
             return
 
     def __repr__(self):
         return self.raw_data, self.host, self.sender, self.receiver, self.timestamp, self.kind, self.data
+
+
+class Task:
+    def __init__(self, task, interval, clock):
+        self.task = task
+        self.interval = interval
+        self.clock = clock
+        self._uasyncio_task = None
+
+    def start(self):
+        async def loop_task():
+            try:
+                wait_time = (self.interval * 1000000) - (self.clock() % (self.interval * 1000000))
+                await uasyncio.sleep_ms(wait_time//1000000)
+                while True:
+                    self.task()
+                    await uasyncio.sleep_ms(self.interval)
+            except uasyncio.CancelledError:
+                pass
+        self._uasyncio_task = uasyncio.create_task(loop_task())
+
+    def reset(self):
+        self._uasyncio_task.cancel()
+        self.start()
