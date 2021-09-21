@@ -1,8 +1,9 @@
 """
-Advertise: 
+Advertise:
     - send list of reacheable peers
 """
 
+import network
 import uasyncio
 import time
 
@@ -15,6 +16,7 @@ class Mesh:
         # ourPeer -> [unreacheable peers...]
         self.peers = dict()
         self.espnow = espnow
+        self.mac_addr = network.WLAN().config('mac')
         self.stream_reader = uasyncio.StreamReader(self.espnow)
 
         # TODO: check if BROADCAST is already there
@@ -26,20 +28,23 @@ class Mesh:
 
         # TODO: reverse peers
 
+    def send(self, message):
+        self.espnow.send(message.receiver, message.as_bytearray())
+
     async def advertise(self):
         while True:
-            msg = bytearray([Message.ADVERTISEMENT]) + sum(list(self.peers.keys()), b'')
-            self.espnow.send(BROADCAST, msg, False)
+            msg = Message(kind=Message.ADVERTISEMENT, sender=self.mac_addr, receiver=BROADCAST, data=self.peers.keys())
+            self.send(msg)
             await uasyncio.sleep_ms(500)
 
     async def check_messages(self):
         while True:
             raw_package = await self.stream_reader.read(-1)
-            mesh_msg = Message(raw_package)
-            if mesh_msg.kind == Message.ADVERTISEMENT:
-                self.on_advertisement(mesh_msg)
+            msg = Message(raw_package)
+            if msg.kind == Message.ADVERTISEMENT:
+                self.on_advertisement(msg)
             await uasyncio.sleep_ms(100)
-   
+
     async def remove_dead_peers(self):
         while True:
             now = time.time_ns()
@@ -49,12 +54,12 @@ class Mesh:
                     print("removed: ", host)
             await uasyncio.sleep_ms(200)
 
-    def on_advertisement(self, mesh_msg):
-        if mesh_msg.host not in self.peers:
-            self.on_new_reacheable_peer(mesh_msg.host, mesh_msg.data)
+    def on_advertisement(self, message):
+        if message.host not in self.peers:
+            self.on_new_reacheable_peer(message.host, message.data)
 
         # Update the list of unreacheable peers
-        self.peers[mesh_msg.host] = {'last_seen': time.time_ns(), 'peers': mesh_msg.data}
+        self.peers[message.host] = {'last_seen': time.time_ns(), 'peers': message.data}
         print(self.peers)
 
     def on_new_reacheable_peer(self, host, peers):
@@ -69,16 +74,39 @@ class Mesh:
 class Message:
     ADVERTISEMENT = 0
 
-    def __init__(self, raw_data):
+    def __init__(self, raw_data=b'', host=b'', sender=b'', receiver=b'', timestamp=b'', kind=-1, data=None):
         self.raw_data = raw_data
-        self.host, self.kind, self.data = self._parse_raw_data()
-   
+        self.host = host
+        self.sender = sender
+        self.receiver = receiver
+        self.timestamp = b'\x00\x00\x00\x00\x00\x00'
+        self.kind = kind
+        self.data = data
+
+        if raw_data:
+            self._parse_raw_data()
+
+    def as_bytearray(self):
+        raw_data = self.sender + self.receiver + self.timestamp + bytearray([self.kind])
+        if self.kind == Message.ADVERTISEMENT and self.data:
+            raw_data = raw_data + sum(self.data, b'')
+        return raw_data
+
     def _parse_raw_data(self):
-        host, kind, payload = self.raw_data[2:8], self.raw_data[8], self.raw_data[9:]
-        data = None
-        if kind == Message.ADVERTISEMENT:
-            data = [ payload[i:i + MAC_ADDR_LENGTH] for i in range(0, len(payload), MAC_ADDR_LENGTH) ]
-        return host, kind, data
+        try:
+            self.host, self.sender, self.receiver, self.timestamp, self.kind, payload = (
+                    self.raw_data[2:8], self.raw_data[8:14], self.raw_data[14:20],
+                    self.raw_data[20:26], self.raw_data[26], self.raw_data[27:]
+                    )
+        except IndexError as err:
+            # Got bad message?
+            print("Got a bad message: ", self.raw_data)
+        else:
+            self._parse_payload(payload)
+
+    def _parse_payload(self, payload):
+        if self.kind == Message.ADVERTISEMENT:
+            self.data = [ payload[i:i + MAC_ADDR_LENGTH] for i in range(0, len(payload), MAC_ADDR_LENGTH) ]
 
     def __repr__(self):
-        return self.raw_data, self.kind, self.host, self.data
+        return self.raw_data, self.host, self.sender, self.receiver, self.timestamp, self.kind, self.data
