@@ -220,11 +220,10 @@ class Task:
     def start(self):
         async def loop_task():
             try:
-                wait_time = (self.interval * 1000000) - (self.clock() % (self.interval * 1000000))
-                await uasyncio.sleep_ms(wait_time//1000000)
                 while True:
                     self.task()
-                    await uasyncio.sleep_ms(self.interval)
+                    wait_time = (self.interval * 1000000) - (self.clock() % (self.interval * 1000000))
+                    await uasyncio.sleep_ms(wait_time//1000000)
             except uasyncio.CancelledError:
                 pass
         self._uasyncio_task = uasyncio.create_task(loop_task())
